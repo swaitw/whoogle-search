@@ -1,13 +1,16 @@
 from app.models.config import Config
+from app.utils.misc import read_config_bool
 from datetime import datetime
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 import random
 import requests
 from requests import Response, ConnectionError
 import urllib.parse as urlparse
 import os
 from stem import Signal, SocketError
+from stem.connection import AuthenticationFailure
 from stem.control import Controller
+from stem.connection import authenticate_cookie, authenticate_password
 
 MAPS_URL = 'https://maps.google.com/maps'
 AUTOCOMPLETE_URL = ('https://suggestqueries.google.com/'
@@ -37,19 +40,51 @@ class TorError(Exception):
 
 
 def send_tor_signal(signal: Signal) -> bool:
+    use_pass = read_config_bool('WHOOGLE_TOR_USE_PASS')
+
+    confloc = './misc/tor/control.conf'
+    # Check that the custom location of conf is real.
+    temp = os.getenv('WHOOGLE_TOR_CONF', '')
+    if os.path.isfile(temp):
+        confloc = temp
+
+    # Attempt to authenticate and send signal.
     try:
         with Controller.from_port(port=9051) as c:
-            c.authenticate()
+            if use_pass:
+                with open(confloc, "r") as conf:
+                    # Scan for the last line of the file.
+                    for line in conf:
+                        pass
+                    secret = line.strip('\n')
+                authenticate_password(c, password=secret)
+            else:
+                cookie_path = '/var/lib/tor/control_auth_cookie'
+                authenticate_cookie(c, cookie_path=cookie_path)
             c.signal(signal)
             os.environ['TOR_AVAILABLE'] = '1'
             return True
-    except (SocketError, ConnectionRefusedError, ConnectionError):
+    except (SocketError, AuthenticationFailure,
+            ConnectionRefusedError, ConnectionError):
+        # TODO: Handle Tor authentication (password and cookie)
         os.environ['TOR_AVAILABLE'] = '0'
 
     return False
 
 
-def gen_user_agent(is_mobile) -> str:
+def gen_user_agent(config, is_mobile) -> str:
+    # Define the Lynx user agent
+    LYNX_UA = 'Lynx/2.9.2 libwww-FM/2.14 SSL-MM/1.4.1 OpenSSL/3.4.0'
+
+    # If using custom user agent, return the custom string
+    if config.user_agent == 'custom' and config.custom_user_agent:
+        return config.custom_user_agent
+
+    # If using Lynx user agent
+    if config.user_agent == 'LYNX_UA':
+        return LYNX_UA
+
+    # If no custom user agent is set, generate a random one
     firefox = random.choice(['Choir', 'Squier', 'Higher', 'Wire']) + 'fox'
     linux = random.choice(['Win', 'Sin', 'Gin', 'Fin', 'Kin']) + 'ux'
 
@@ -59,7 +94,7 @@ def gen_user_agent(is_mobile) -> str:
     return DESKTOP_UA.format("Mozilla", linux, firefox)
 
 
-def gen_query(query, args, config, near_city=None) -> str:
+def gen_query(query, args, config) -> str:
     param_dict = {key: '' for key in VALID_PARAMS}
 
     # Use :past(hour/day/week/month/year) if available
@@ -68,8 +103,8 @@ def gen_query(query, args, config, near_city=None) -> str:
     if ':past' in query and 'tbs' not in args:
         time_range = str.strip(query.split(':past', 1)[-1])
         param_dict['tbs'] = '&tbs=' + ('qdr:' + str.lower(time_range[0]))
-    elif 'tbs' in args:
-        result_tbs = args.get('tbs')
+    elif 'tbs' in args or 'tbs' in config:
+        result_tbs = args.get('tbs') if 'tbs' in args else config['tbs']
         param_dict['tbs'] = '&tbs=' + result_tbs
 
         # Occasionally the 'tbs' param provided by google also contains a
@@ -96,8 +131,8 @@ def gen_query(query, args, config, near_city=None) -> str:
         param_dict['start'] = '&start=' + args.get('start')
 
     # Search for results near a particular city, if available
-    if near_city:
-        param_dict['near'] = '&near=' + urlparse.quote(near_city)
+    if config.near:
+        param_dict['near'] = '&near=' + urlparse.quote(config.near)
 
     # Set language for results (lr) if source isn't set, otherwise use the
     # result language param provided in the results
@@ -107,9 +142,9 @@ def gen_query(query, args, config, near_city=None) -> str:
             [_ for _ in lang if not _.isdigit()]
         )) if lang else ''
     else:
-        param_dict['lr'] = '&lr=' + (
-            config.lang_search if config.lang_search else ''
-        )
+        param_dict['lr'] = (
+            '&lr=' + config.lang_search
+        ) if config.lang_search else ''
 
     # 'nfpr' defines the exclusion of results from an auto-corrected query
     if 'nfpr' in args:
@@ -120,11 +155,12 @@ def gen_query(query, args, config, near_city=None) -> str:
     if 'chips' in args:
         param_dict['chips'] = '&chips=' + args.get('chips')
 
-    param_dict['cr'] = ('&cr=' + config.ctry) if config.ctry else ''
-    param_dict['hl'] = '&hl=' + (
-        config.lang_interface.replace('lang_', '')
-        if config.lang_interface else ''
-    )
+    param_dict['gl'] = (
+        '&gl=' + config.country
+    ) if config.country else ''
+    param_dict['hl'] = (
+        '&hl=' + config.lang_interface.replace('lang_', '')
+    ) if config.lang_interface else ''
     param_dict['safe'] = '&safe=' + ('active' if config.safe else 'off')
 
     # Block all sites specified in the user config
@@ -160,9 +196,8 @@ class Request:
         # enable Tor for future requests
         send_tor_signal(Signal.HEARTBEAT)
 
-        self.language = (
-            config.lang_search if config.lang_search else ''
-        )
+        self.language = config.lang_search if config.lang_search else ''
+        self.country = config.country if config.country else ''
 
         # For setting Accept-language Header
         self.lang_interface = ''
@@ -171,11 +206,13 @@ class Request:
 
         self.mobile = bool(normal_ua) and ('Android' in normal_ua
                                            or 'iPhone' in normal_ua)
-        self.modified_user_agent = gen_user_agent(self.mobile)
-        if not self.mobile:
-            self.modified_user_agent_mobile = gen_user_agent(True)
 
-        # Set up proxy, if previously configured
+        # Generate user agent based on config
+        self.modified_user_agent = gen_user_agent(config, self.mobile)
+        if not self.mobile:
+            self.modified_user_agent_mobile = gen_user_agent(config, True)
+
+        # Set up proxy configuration
         proxy_path = os.environ.get('WHOOGLE_PROXY_LOC', '')
         if proxy_path:
             proxy_type = os.environ.get('WHOOGLE_PROXY_TYPE', '')
@@ -183,24 +220,19 @@ class Request:
             proxy_pass = os.environ.get('WHOOGLE_PROXY_PASS', '')
             auth_str = ''
             if proxy_user:
-                auth_str = proxy_user + ':' + proxy_pass
-            self.proxies = {
-                'https': proxy_type + '://' +
-                ((auth_str + '@') if auth_str else '') + proxy_path,
-            }
+                auth_str = f'{proxy_user}:{proxy_pass}@'
 
-            # Need to ensure both HTTP and HTTPS are in the proxy dict,
-            # regardless of underlying protocol
-            if proxy_type == 'https':
-                self.proxies['http'] = self.proxies['https'].replace(
-                    'https', 'http')
-            else:
-                self.proxies['http'] = self.proxies['https']
+            proxy_str = f'{proxy_type}://{auth_str}{proxy_path}'
+            self.proxies = {
+                'https': proxy_str,
+                'http': proxy_str
+            }
         else:
             self.proxies = {
                 'http': 'socks5://127.0.0.1:9050',
                 'https': 'socks5://127.0.0.1:9050'
             } if config.tor else {}
+
         self.tor = config.tor
         self.tor_valid = False
         self.root_path = root_path
@@ -218,19 +250,30 @@ class Request:
             list: The list of matches for possible search suggestions
 
         """
-        ac_query = dict(hl=self.language, q=query)
+        ac_query = dict(q=query)
+        if self.language:
+            ac_query['lr'] = self.language
+        if self.country:
+            ac_query['gl'] = self.country
+        if self.lang_interface:
+            ac_query['hl'] = self.lang_interface
+
         response = self.send(base_url=AUTOCOMPLETE_URL,
                              query=urlparse.urlencode(ac_query)).text
 
         if not response:
             return []
 
-        root = ET.fromstring(response)
-        return [_.attrib['data'] for _ in
-                root.findall('.//suggestion/[@data]')]
+        try:
+            root = ET.fromstring(response)
+            return [_.attrib['data'] for _ in
+                    root.findall('.//suggestion/[@data]')]
+        except ET.ParseError:
+            # Malformed XML response
+            return []
 
     def send(self, base_url='', query='', attempt=0,
-             force_mobile=False) -> Response:
+             force_mobile=False, user_agent='') -> Response:
         """Sends an outbound request to a URL. Optionally sends the request
         using Tor, if enabled by the user.
 
@@ -246,10 +289,14 @@ class Request:
             Response: The Response object returned by the requests call
 
         """
-        if force_mobile and not self.mobile:
-            modified_user_agent = self.modified_user_agent_mobile
+        use_client_user_agent = int(os.environ.get('WHOOGLE_USE_CLIENT_USER_AGENT', '0'))
+        if user_agent and use_client_user_agent == 1:
+            modified_user_agent = user_agent
         else:
-            modified_user_agent = self.modified_user_agent
+            if force_mobile and not self.mobile:
+                modified_user_agent = self.modified_user_agent_mobile
+            else:
+                modified_user_agent = self.modified_user_agent
 
         headers = {
             'User-Agent': modified_user_agent
@@ -264,9 +311,8 @@ class Request:
         # view is suppressed correctly
         now = datetime.now()
         cookies = {
-            'CONSENT': 'YES+cb.{:d}{:02d}{:02d}-17-p0.de+F+678'.format(
-                now.year, now.month, now.day
-            )
+            'CONSENT': 'PENDING+987',
+            'SOCS': 'CAESHAgBEhIaAB',
         }
 
         # Validate Tor conn and request new identity if the last one failed
